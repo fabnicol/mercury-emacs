@@ -1,0 +1,332 @@
+diff --git a/lib-src/etags.c b/lib-src/etags.c
+index b5c18e0..8aa9e8c 100644
+--- a/lib-src/etags.c
++++ b/lib-src/etags.c
+@@ -364,6 +364,7 @@ #define xrnew(op, n, m) ((op) = xnrealloc (op, n, (m) * sizeof *(op)))
+ static void PHP_functions (FILE *);
+ static void PS_functions (FILE *);
+ static void Prolog_functions (FILE *);
++static void Mercury_functions (FILE *);
+ static void Python_functions (FILE *);
+ static void Ruby_functions (FILE *);
+ static void Scheme_functions (FILE *);
+@@ -685,7 +686,6 @@ #define STDIN 0x1001		/* returned by getopt_long on --parse-stdin */
+
+ static const char *Objc_suffixes [] =
+   { "lm",			/* Objective lex file */
+-    "m",			/* Objective C file */
+      NULL };
+ static const char Objc_help [] =
+ "In Objective C code, tags include Objective C definitions for classes,\n\
+@@ -734,6 +734,15 @@ #define STDIN 0x1001		/* returned by getopt_long on --parse-stdin */
+ static const char *Prolog_interpreters [] =
+   { "gprolog", "pl", "yap", "swipl", "prolog", NULL };
+
++static const char *Mercury_decl_tags[] = {"type", "solver type", "pred",
++  "func", "inst", "mode", "typeclass", "instance", "pragma", "promise",
++  "initialise", "finalise", "mutable", "module", "interface", "implementation",
++  "import_module", "use_module", "include_module", "end_module"};
++static const char *Mercury_suffixes [] =
++  { "m", NULL };
++static const char Mercury_help [] =
++  "In Mercury code, tags are all declarations beginning a line with :-";
++
+ static const char *Python_suffixes [] =
+   { "py", NULL };
+ static const char Python_help [] =
+@@ -832,6 +841,7 @@ #define STDIN 0x1001		/* returned by getopt_long on --parse-stdin */
+   { "proc",      no_lang_help,   plain_C_entries,   plain_C_suffixes   },
+   { "prolog",    Prolog_help,    Prolog_functions,  Prolog_suffixes,
+                  NULL,           Prolog_interpreters },
++  { "mercury",   Mercury_help,   Mercury_functions, Mercury_suffixes },
+   { "python",    Python_help,    Python_functions,  Python_suffixes,
+                  NULL,           Python_interpreters },
+   { "ruby",      Ruby_help,      Ruby_functions,    Ruby_suffixes,
+@@ -2297,7 +2307,7 @@ invalidate_nodes (fdesc *badfdp, node **npp)
+     }
+ }
+
+-
++
+ static ptrdiff_t total_size_of_entries (node *);
+ static int number_len (intmax_t) ATTRIBUTE_CONST;
+
+@@ -3222,7 +3232,7 @@ consider_token (char *str,	      /* IN: token pointer */
+   return false;
+ }
+
+-
++
+ /*
+  * C_entries often keeps pointers to tokens or lines which are older than
+  * the line currently read.  By keeping two line buffers, and switching
+@@ -5890,2 +5900,2 @@ Prolog_functions (FILE *inf)
+     {
+       if (cp[0] == '\0')	/* Empty line */
+	continue;
+-      else if (c_isspace (cp[0])) /* Not a predicate */
++      else if (c_isspace (cp[0]) || cp[0] == '%')
++	/* Not a predicate or comment */
+	continue;
+       else if (cp[0] == '/' && cp[1] == '*')	/* comment. */
+	prolog_skip_comment (&lb, inf);
+@@ -6019,7 +6030,258 @@ prolog_atom (char *s, size_t pos)
+     return 0;
+ }
+
+-
++/*
++ * Mercury support
++ *
++ * Assumes that the declarationa starts at column 0.
++ * Original code by Sunichirou Sugou (1989) for Prolog.
++ * Rewritten by Anders Lindgren (1996) for Prolog.
++ * Adapted by Fabrice Nicol (2021) for Mercury.
++ */
++static ptrdiff_t mercury_pr (char *, char *, ptrdiff_t);
++static void mercury_skip_comment (linebuffer *, FILE *);
++static int is_mercury_type = 0;
++
++static void
++Mercury_functions (FILE *inf)
++{
++  char *cp, *last = NULL;
++  ptrdiff_t lastlen = 0, allocated = 0;
++
++  LOOP_ON_INPUT_LINES (inf, lb, cp)
++    {
++      if (cp[0] == '\0')	/* Empty line */
++	continue;
++      else if (c_isspace (cp[0]) || cp[0] == '%')
++	/*  a comment or anything other than a declaration */
++	continue;
++      else if (cp[0] == '/' && cp[1] == '*')	/* comment. */
++	mercury_skip_comment (&lb, inf);
++      else if (cp[0] != ':' || cp[1] != '-')  /* not a declaration */
++        continue;
++      else
++	{
++	  ptrdiff_t len = mercury_pr (cp, last, lastlen);
++	  if (0 < len)
++	    {
++	      /* Store the declaration to avoid generating duplicate
++		 tags later.  */
++	      if (allocated <= len)
++		{
++		  xrnew (last, len + 1, 1);
++		  allocated = len + 1;
++		}
++	      memcpyz (last, cp, len);
++	      lastlen = len;
++	    }
++	}
++    }
++  free (last);
++}
++
++
++static void
++mercury_skip_comment (linebuffer *plb, FILE *inf)
++{
++  char *cp;
++
++  do
++    {
++      for (cp = plb->buffer; *cp != '\0'; cp++)
++	if (cp[0] == '*' && cp[1] == '/')
++	  return;
++      readline (plb, inf);
++    }
++  while (perhaps_more_input (inf));
++}
++
++/*
++ * A declaration is added if it matches:
++ *     <beginning of line>:-<whitespace><Mercury Term><whitespace>(
++ *
++ * It is added to the tags database if it doesn't match the
++ * name of the previous declaration.
++ *
++ * Return the size of the name of the declaration or 0 if no
++ * header was found.
++ */
++
++/*
++ * Consume a Mercury declaration.
++ * Return the number of bytes consumed, or 0 if there was an error.
++ *
++ * A Mercury declaration, in this context, must be one of:
++ *  :- type
++ *  :- solver type
++ *  :- pred
++ *  :- func
++ *  :- inst
++ *  :- mode
++ *  :- typeclass
++ *  :- instance
++ *  :- pragma
++ *  :- promise
++ *  :- initialise
++ *  :- finalise
++ *  :- mutable
++ *  :- module
++ *  :- interface
++ *  :- implementation
++ *  :- import_module
++ *  :- use_module
++ *  :- include_module
++ *  :- end_module
++ * followed on the same line  by an alphanumeric sequence,
++ * starting with a lower case letter or by a single-quoted arbitrary string.
++ * Single quotes can escape themselves. Backslash quotes everything.
++ */
++
++
++static size_t
++mercury_decl (char *s, size_t pos)
++{
++  size_t origpos;
++  origpos = pos;
++
++  while (s + pos != NULL && (c_isalnum (s[pos]) || s[pos] == '_'))
++  {
++     ++pos;
++  }
++
++  if (s == NULL)
++    return 0;
++
++  uint8_t decl_type_length = pos - origpos;
++  char buf[decl_type_length + 1];
++  memset(buf, 0, decl_type_length+1);
++
++  /* Mercury declaration tags. Consume them, then check the declaration item
++     following :- is legitimate, then go on as in the prolog case. */
++
++  memcpy(buf, &s[origpos], decl_type_length);
++
++  int found_decl_tag = 0;
++
++  for (int j = 0; j < sizeof(Mercury_decl_tags)/sizeof(char*); ++j)
++    {
++        if (strcmp(buf, Mercury_decl_tags[j]) == 0)
++	{
++	  found_decl_tag = 1;
++	  if (strcmp(Mercury_decl_tags[j], "type") == 0)
++	    is_mercury_type = 1;
++
++	  break;  // found declaration tag of rank j
++	}
++	else
++
++	/* 'solver type' has a blank in the middle,
++	so this is the hard case */
++
++	if (strcmp(buf, "solver") == 0)
++	{
++	  ++pos;
++	  while (s + pos != NULL && (c_isalnum (s[pos]) || s[pos] == '_'))
++	  {
++	     ++pos;
++	  }
++          decl_type_length = pos - origpos;
++          char buf2[decl_type_length + 1];
++          memset(buf2, 0, decl_type_length + 1);
++          memcpy(buf2, &s[origpos], decl_type_length);
++
++          if (strcmp(buf2, "solver type") == 0)
++          {
++	    found_decl_tag = 1;
++            break;  // found declaration tag of rank j
++	  }
++	}
++    }
++
++  if (! found_decl_tag)  // this is a Mercury syntax error, ignoring...
++   {
++     return 0;
++   }
++
++  pos = skip_spaces (s + pos) - s; // skip len blanks again;
++
++  // From now on it is the same as for Prolog
++
++  if (c_islower (s[pos]) || s[pos] == '_' )
++    {
++      /* The name is unquoted.
++         Do not forget module dots withoput confusing
++         them with end-of-decl dots. */
++
++      while (c_isalnum (s[pos])
++             || s[pos] == '_'
++             || (s[pos] == '.'
++                 && s + pos + 1 != NULL
++                 && (c_isalnum (s[pos + 1]) || s[pos + 1] == '_')))
++	{
++          ++pos;
++	}
++
++      return pos - origpos;
++    }
++  else if (s[pos] == '\'')
++    {
++      ++pos;
++
++      for (;;)
++	{
++	  if (s[pos] == '\'')
++	    {
++	      ++pos;
++	      if (s[pos] != '\'')
++		break;
++	      ++pos;		/* A double quote */
++	    }
++	  else if (s[pos] == '\0')
++	    /* Multiline quoted atoms are ignored. */
++	    return 0;
++	  else if (s[pos] == '\\')
++	    {
++	      if (s[pos+1] == '\0')
++		return 0;
++	      pos += 2;
++	    }
++	  else
++	    ++pos;
++	}
++       return pos - origpos;
++    }
++  else
++    return 0;
++}
++
++static ptrdiff_t
++mercury_pr (char *s, char *last, ptrdiff_t lastlen)
++{
++  size_t len0 = skip_spaces (s + 2) - s; // skip len blanks
++  size_t len = mercury_decl (s , len0);
++
++  if (len == 0)
++    return 0;
++
++  len += len0;
++
++  if (( (s[len] == '.'
++           || (s[len] == '(' && (len += 1))
++           || (s[len] == ':' && s[len + 1] == '-' && (len += 2)))
++             && ! (lastlen == len && memcmp (s, last, len) == 0)
++      )
++      || is_mercury_type)
++    {
++      make_tag (s, 0, true, s, len, lineno, linecharno);
++      is_mercury_type = 0;
++      return len;
++    }
++
++  return 0;
++}
++
++
++
+ /*
+  * Support for Erlang
+  *
