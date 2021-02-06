@@ -503,6 +503,7 @@ static struct option longopts[] =
   { "ignore-case-regex",  required_argument, NULL,               'c'   },
   { "parse-stdin",        required_argument, NULL,               STDIN },
   { "version",            no_argument,       NULL,               'V'   },
+  { "with-definitions",   no_argument,       NULL,               'W'   },
 
 #if CTAGS /* Ctags options */
   { "backward-search",    no_argument,       NULL,               'B'   },
@@ -738,10 +739,13 @@ static const char *Mercury_decl_tags[] = {"type", "solver type", "pred",
   "func", "inst", "mode", "typeclass", "instance", "pragma", "promise",
   "initialise", "finalise", "mutable", "module", "interface", "implementation",
   "import_module", "use_module", "include_module", "end_module"};
+static bool with_prolog_like_definitions = false;
 static const char *Mercury_suffixes [] =
   { "m", NULL };
 static const char Mercury_help [] =
-  "In Mercury code, tags are all declarations beginning a line with :-";
+  "In Mercury code, tags are all declarations beginning a line with :-\n\
+and optionally Prolog-like definitions (first rule for a predicate).\n\
+To enable this behavior, run etags using --with-definitions.";
 
 static const char *Python_suffixes [] =
   { "py", NULL };
@@ -1071,6 +1075,11 @@ Relative ones are stored relative to the output file's directory.\n");
         which you like.");
     }
 
+  puts ("-W, --with-definitions\n\
+        For the Mercury programming language, include both declarations and\n\
+	definitions. Declarations start a line with :- while definitions\n\
+	are first rules for a given predicate, as for Prolog.");
+
   puts ("-V, --version\n\
         Print the version of the program.\n\
 -h, --help\n\
@@ -1121,7 +1130,7 @@ main (int argc, char **argv)
 
   /* When the optstring begins with a '-' getopt_long does not rearrange the
      non-options arguments to be at the end, but leaves them alone. */
-  optstring = concat ("-ac:Cf:Il:o:Qr:RSVhH",
+  optstring = concat ("-ac:Cf:Il:o:Qr:RSVhHW",
 		      (CTAGS) ? "BxdtTuvw" : "Di:",
 		      "");
 
@@ -1211,6 +1220,9 @@ main (int argc, char **argv)
 	break;
       case 'Q':
 	class_qualify = 1;
+	break;
+      case 'W':
+	with_prolog_like_definitions = true;
 	break;
 
 	/* Etags options */
@@ -6037,10 +6049,14 @@ prolog_atom (char *s, size_t pos)
  * Original code by Sunichirou Sugou (1989) for Prolog.
  * Rewritten by Anders Lindgren (1996) for Prolog.
  * Adapted by Fabrice Nicol (2021) for Mercury.
+ * Note: Prolog-like behavior is preserved if
+ * --with-definitions is used, corresponding to
+ * with_prolog_like_definitions=true.
  */
 static ptrdiff_t mercury_pr (char *, char *, ptrdiff_t);
 static void mercury_skip_comment (linebuffer *, FILE *);
-static int is_mercury_type = 0;
+static bool is_mercury_type = false;
+static bool is_mercury_declaration = false;
 
 static void
 Mercury_functions (FILE *inf)
@@ -6056,23 +6072,27 @@ Mercury_functions (FILE *inf)
 	/*  a comment or anything other than a declaration */
 	continue;
       else if (cp[0] == '/' && cp[1] == '*')	/* comment. */
-	mercury_skip_comment (&lb, inf);
-      else if (cp[0] != ':' || cp[1] != '-')  /* not a declaration */
-        continue;
+        mercury_skip_comment (&lb, inf);
       else
 	{
-	  ptrdiff_t len = mercury_pr (cp, last, lastlen);
-	  if (0 < len)
+	  is_mercury_declaration = (cp[0] == ':' && cp[1] == '-');
+
+          if (is_mercury_declaration
+	      || with_prolog_like_definitions)
 	    {
-	      /* Store the declaration to avoid generating duplicate
-		 tags later.  */
-	      if (allocated <= len)
+	      ptrdiff_t len = mercury_pr (cp, last, lastlen);
+	      if (0 < len)
 		{
-		  xrnew (last, len + 1, 1);
-		  allocated = len + 1;
+		  /* Store the declaration to avoid generating duplicate
+		     tags later.  */
+		  if (allocated <= len)
+		    {
+		      xrnew (last, len + 1, 1);
+		      allocated = len + 1;
+		    }
+		  memcpyz (last, cp, len);
+		  lastlen = len;
 		}
-	      memcpyz (last, cp, len);
-	      lastlen = len;
 	    }
 	}
     }
@@ -6098,7 +6118,10 @@ mercury_skip_comment (linebuffer *plb, FILE *inf)
 /*
  * A declaration is added if it matches:
  *     <beginning of line>:-<whitespace><Mercury Term><whitespace>(
- *
+ * If with_prolog_like_definitions == true, we also add:
+ *     <beginning of line><Mercury item><whitespace>(
+ * or  <beginning of line><Mercury item><whitespace>:-
+ * as for Prolog support.
  * It is added to the tags database if it doesn't match the
  * name of the previous declaration.
  *
@@ -6160,17 +6183,17 @@ mercury_decl (char *s, size_t pos)
 
   memcpy(buf, &s[origpos], decl_type_length);
 
-  int found_decl_tag = 0;
+  bool found_decl_tag = false;
 
   for (int j = 0; j < sizeof(Mercury_decl_tags)/sizeof(char*); ++j)
     {
         if (strcmp(buf, Mercury_decl_tags[j]) == 0)
 	{
-	  found_decl_tag = 1;
+	  found_decl_tag = true;
 	  if (strcmp(Mercury_decl_tags[j], "type") == 0)
-	    is_mercury_type = 1;
+	    is_mercury_type = true;
 
-	  break;  // found declaration tag of rank j
+	  break;  /* found declaration tag of rank j */
 	}
 	else
 
@@ -6191,20 +6214,34 @@ mercury_decl (char *s, size_t pos)
 
           if (strcmp(buf2, "solver type") == 0)
           {
-	    found_decl_tag = 1;
-            break;  // found declaration tag of rank j
+	    found_decl_tag = false;
+            break;  /* found declaration tag of rank j */
 	  }
 	}
     }
 
-  if (! found_decl_tag)  // this is a Mercury syntax error, ignoring...
+  /* if with_prolog_like_definitions == false
+   * this is a Mercury syntax error, ignoring... */
+
+  if (with_prolog_like_definitions)
    {
-     return 0;
+     if (found_decl_tag)
+       pos = skip_spaces (s + pos) - s; /* skip len blanks again*/
+     else
+       /* Prolog-like behavior
+        * we have parsed the predicate once, yet inappropriately
+	* so restarting again the parsing step */
+       pos = 0;
    }
+  else
+    {
+      if (found_decl_tag)
+	pos = skip_spaces (s + pos) - s; /* skip len blanks again */
+      else
+	return 0;
+    }
 
-  pos = skip_spaces (s + pos) - s; // skip len blanks again;
-
-  // From now on it is the same as for Prolog
+  /* From now on it is the same as for Prolog */
 
   if (c_islower (s[pos]) || s[pos] == '_' )
     {
@@ -6214,11 +6251,12 @@ mercury_decl (char *s, size_t pos)
 
       while (c_isalnum (s[pos])
              || s[pos] == '_'
+	     /* a module dot */
              || (s[pos] == '.'
                  && s + pos + 1 != NULL
                  && (c_isalnum (s[pos + 1]) || s[pos + 1] == '_')))
 	{
-          ++pos;
+	  ++pos;
 	}
 
       return pos - origpos;
@@ -6257,7 +6295,11 @@ mercury_decl (char *s, size_t pos)
 static ptrdiff_t
 mercury_pr (char *s, char *last, ptrdiff_t lastlen)
 {
-  size_t len0 = skip_spaces (s + 2) - s; // skip len blanks
+  size_t len0 = 0;
+  is_mercury_type = false;
+  if (is_mercury_declaration)
+    len0 = skip_spaces (s + 2) - s; /* skip len0 blanks only for declarations */
+
   size_t len = mercury_decl (s , len0);
 
   if (len == 0)
@@ -6265,15 +6307,20 @@ mercury_pr (char *s, char *last, ptrdiff_t lastlen)
 
   len += len0;
 
-  if (( (s[len] == '.'
+  if (( (s[len] == '.'  /* this is a statement dot, not a module dot */
            || (s[len] == '(' && (len += 1))
-           || (s[len] == ':' && s[len + 1] == '-' && (len += 2)))
-             && ! (lastlen == len && memcmp (s, last, len) == 0)
+            /* stopping in case of a rule */
+           || (s[len] == ':'
+	       && s[len + 1] == '-'
+	       && (len += 2)))
+        && ! (lastlen == len
+	      && memcmp (s, last, len) == 0)
       )
+      /* types are often declared on several lines so keepting just
+	 the first */
       || is_mercury_type)
     {
       make_tag (s, 0, true, s, len, lineno, linecharno);
-      is_mercury_type = 0;
       return len;
     }
 
