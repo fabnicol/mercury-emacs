@@ -3567,6 +3567,8 @@ Returns the tag list, or t for an error."
      speedbar-parse-c-or-c++tag)
     ("^\\.emacs$\\|.\\(el\\|l\\|lsp\\)\\'" .
      "def[^i]+\\s-+\\(\\(\\w\\|[-_]\\)+\\)\\s-*\C-?")
+      ("^\\.m$\\'" .
+     "\\(^:-\\)?\\s-*\\(\\(pred\\|func\\|type\\|instance\\|typeclass\\)+\\s+\\([a-z]+[a-zA-Z0-9_]*\\)+\\)\\s-*(?^?")
 ;    ("\\.\\([fF]\\|for\\|FOR\\|77\\|90\\)\\'" .
 ;      speedbar-parse-fortran77-tag)
     ("\\.tex\\'" . speedbar-parse-tex-string)
